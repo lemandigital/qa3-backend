@@ -14,7 +14,7 @@ const bedrockClient = new BedrockRuntimeClient({
 // const MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0";
 
 // Model Claude Haiku 5.5 - idealny stosunek ceny do prędkości
-const MODEL_ID = "anthropic.claude-haiku-5-5";
+const MODEL_ID = "eu.amazon.nova-lite-v1:0";
 
 /**
  * Definicja narzędzia (Tool Configuration) wymuszająca zwrot idealnego obiektu JSON.
@@ -123,7 +123,7 @@ Please generate the application messages based on this profile:
       ],
       toolConfig: toolConfiguration,
       // Temperatura 0.2 zapewnia powtarzalność, gramatyczną poprawność i mniejszą "kreatywną halucynację"
-      inferenceConfig: { temperature: 0.2, topP: 0.9 },
+      inferenceConfig: { temperature: 0.2 },
     });
 
     const response = await bedrockClient.send(command);
