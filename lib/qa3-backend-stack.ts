@@ -226,6 +226,8 @@ export class Qa3BackendStack extends cdk.Stack {
       resources: [
         `arn:aws:bedrock:eu-central-1:261175718378:inference-profile/eu.amazon.nova-lite-v1:0`,
         `arn:aws:bedrock:*::foundation-model/amazon.nova-lite-v1:0`,
+        `arn:aws:bedrock:eu-central-1:261175718378:inference-profile/eu.amazon.nova-2-lite-v1:0`,
+        `arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0`,
       ],
     });
 

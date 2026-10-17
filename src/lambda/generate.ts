@@ -14,7 +14,7 @@ const bedrockClient = new BedrockRuntimeClient({
 // const MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0";
 
 // Model Claude Haiku 5.5 - idealny stosunek ceny do prędkości
-const MODEL_ID = "eu.amazon.nova-lite-v1:0";
+const MODEL_ID = "eu.amazon.nova-2-lite-v1:0";
 
 /**
  * Definicja narzędzia (Tool Configuration) wymuszająca zwrot idealnego obiektu JSON.
@@ -91,6 +91,7 @@ CRITICAL RULES:
 - Translate local context accurately (e.g., permit_B means "Permis B", clean_record means "casier judiciaire vierge").
 - Keep vocabulary straightforward and professional. No corporate fluff.
 - If a name is missing, adapt the text naturally. Do NOT use placeholders like [Name].
+- If some information of the profile details is missing, omit it gracefully. Do NOT invent details.
     `.trim();
 
     // 3. Konstrukcja Promptu Użytkownika (Wstrzyknięcie zmiennych przez XML)
