@@ -7,10 +7,185 @@ import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as wafv2 from "aws-cdk-lib/aws-wafv2";
+import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
+import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as path from "path";
 
-export class Qa3BackendStack extends cdk.Stack {
+// Domena API (DNS w Cloudflare - rekordy dodawane ręcznie, patrz outputy stacków)
+const API_DOMAIN = "api.qa3.ch";
+
+// Ścieżka endpointu generowania - wspólna dla routingu API Gateway i reguły WAF
+const GENERATE_PATH = "/api/v1/generate";
+
+// Rate limit per IP (WAF dopuszcza okna 60, 120, 300 lub 600 sekund)
+const RATE_LIMIT_REQUESTS = 10;
+const RATE_LIMIT_WINDOW_SECONDS = 300;
+
+// Nagłówek z IP klienta końcowego, ustawiany przez serwer Next.js
+const CLIENT_IP_HEADER = "x-client-ip";
+
+/**
+ * Web ACL (scope: CLOUDFRONT) i certyfikat ACM dla CloudFront muszą powstać w us-east-1,
+ * dlatego są osobnym stackiem, a trafiają do Qa3BackendStack przez crossRegionReferences.
+ */
+export class Qa3WafStack extends cdk.Stack {
+  public readonly webAclArn: string;
+  public readonly certificate: acm.ICertificate;
+
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // Żądania objęte limitem: POST na endpoint generowania (preflight OPTIONS z przeglądarki nie zużywa limitu)
+    const generateRequestStatements: wafv2.CfnWebACL.StatementProperty[] = [
+      {
+        byteMatchStatement: {
+          fieldToMatch: { uriPath: {} },
+          searchString: GENERATE_PATH,
+          positionalConstraint: "STARTS_WITH",
+          // Dekodowanie URL, żeby nie dało się obejść reguły zakodowaną ścieżką (np. /api/v1/%67enerate)
+          textTransformations: [{ priority: 0, type: "URL_DECODE" }],
+        },
+      },
+      {
+        byteMatchStatement: {
+          fieldToMatch: { method: {} },
+          searchString: "POST",
+          positionalConstraint: "EXACTLY",
+          textTransformations: [{ priority: 0, type: "NONE" }],
+        },
+      },
+    ];
+
+    // Dopasowuje żądania, które mają nagłówek x-client-ip (sprawdzamy nazwę nagłówka, nie wartość)
+    const hasClientIpHeader: wafv2.CfnWebACL.StatementProperty = {
+      byteMatchStatement: {
+        fieldToMatch: {
+          headers: {
+            matchPattern: { includedHeaders: [CLIENT_IP_HEADER] },
+            matchScope: "KEY",
+            oversizeHandling: "CONTINUE",
+          },
+        },
+        searchString: CLIENT_IP_HEADER,
+        positionalConstraint: "EXACTLY",
+        textTransformations: [{ priority: 0, type: "LOWERCASE" }],
+      },
+    };
+
+    // Wspólna akcja obu reguł: 429 z JSON-em i Retry-After
+    const tooManyRequestsAction: wafv2.CfnWebACL.RuleActionProperty = {
+      block: {
+        customResponse: {
+          responseCode: 429,
+          customResponseBodyKey: "TooManyRequests",
+          responseHeaders: [
+            { name: "Retry-After", value: String(RATE_LIMIT_WINDOW_SECONDS) },
+            // Bez nagłówka CORS przeglądarka nie pozwoli frontendowi odczytać odpowiedzi 429
+            { name: "Access-Control-Allow-Origin", value: "*" },
+          ],
+        },
+      },
+    };
+
+    const webAcl = new wafv2.CfnWebACL(this, "Qa3WebAcl", {
+      name: "qa3-api-web-acl",
+      scope: "CLOUDFRONT",
+      // Domyślnie przepuszczamy ruch - blokuje tylko reguła rate limitu
+      defaultAction: { allow: {} },
+      visibilityConfig: {
+        cloudWatchMetricsEnabled: true,
+        metricName: "qa3-api-web-acl",
+        sampledRequestsEnabled: true,
+      },
+      // Treść odpowiedzi 429 zwracanej przez WAF
+      customResponseBodies: {
+        TooManyRequests: {
+          contentType: "APPLICATION_JSON",
+          content: JSON.stringify({
+            error: "Too Many Requests",
+            message: "Rate limit exceeded. Please try again later.",
+          }),
+        },
+      },
+      rules: [
+        {
+          name: "RateLimitGenerateByClientIp",
+          priority: 0,
+          statement: {
+            rateBasedStatement: {
+              limit: RATE_LIMIT_REQUESTS,
+              evaluationWindowSec: RATE_LIMIT_WINDOW_SECONDS,
+              // Liczymy per IP klienta z nagłówka x-client-ip (WAF bierze pierwszy adres z nagłówka)
+              aggregateKeyType: "FORWARDED_IP",
+              forwardedIpConfig: {
+                headerName: CLIENT_IP_HEADER,
+                // Niepoprawne IP w nagłówku = od razu 429, inaczej dałoby się obejść limit dowolną wartością
+                fallbackBehavior: "MATCH",
+              },
+              scopeDownStatement: {
+                andStatement: { statements: generateRequestStatements },
+              },
+            },
+          },
+          action: tooManyRequestsAction,
+          visibilityConfig: {
+            cloudWatchMetricsEnabled: true,
+            metricName: "qa3-rate-limit-generate-client-ip",
+            sampledRequestsEnabled: true,
+          },
+        },
+        {
+          name: "RateLimitGenerateBySourceIp",
+          priority: 1,
+          statement: {
+            rateBasedStatement: {
+              limit: RATE_LIMIT_REQUESTS,
+              evaluationWindowSec: RATE_LIMIT_WINDOW_SECONDS,
+              // Gdy brak nagłówka x-client-ip, WAF pomija regułę powyżej - wtedy liczymy per IP nadawcy
+              aggregateKeyType: "IP",
+              scopeDownStatement: {
+                andStatement: {
+                  statements: [
+                    ...generateRequestStatements,
+                    { notStatement: { statement: hasClientIpHeader } },
+                  ],
+                },
+              },
+            },
+          },
+          action: tooManyRequestsAction,
+          visibilityConfig: {
+            cloudWatchMetricsEnabled: true,
+            metricName: "qa3-rate-limit-generate-source-ip",
+            sampledRequestsEnabled: true,
+          },
+        },
+      ],
+    });
+
+    this.webAclArn = webAcl.attrArn;
+
+    // Certyfikat SSL dla api.qa3.ch. Walidacja DNS: deploy czeka, aż rekord CNAME z ACM
+    // zostanie dodany w Cloudflare (nazwa i wartość są w zdarzeniach CloudFormation / konsoli ACM).
+    // Rekord musi zostać na stałe - ACM używa go do automatycznego odnawiania certyfikatu.
+    this.certificate = new acm.Certificate(this, "ApiCertificate", {
+      domainName: API_DOMAIN,
+      validation: acm.CertificateValidation.fromDns(),
+    });
+  }
+}
+
+export interface Qa3BackendStackProps extends cdk.StackProps {
+  // ARN Web ACL z Qa3WafStack (us-east-1)
+  webAclArn: string;
+  // Certyfikat dla API_DOMAIN z Qa3WafStack (us-east-1)
+  certificate: acm.ICertificate;
+}
+
+export class Qa3BackendStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props: Qa3BackendStackProps) {
     super(scope, id, props);
 
     // ==========================================
@@ -133,20 +308,54 @@ export class Qa3BackendStack extends cdk.Stack {
 
     // Definiujemy routing: POST /api/v1/generate trafia do Lambdy (tylko z poprawnym kluczem API)
     httpApi.addRoutes({
-      path: "/api/v1/generate",
+      path: GENERATE_PATH,
       methods: [apigwv2.HttpMethod.POST],
       integration: lambdaIntegration,
       authorizer: apiKeyAuthorizer,
     });
 
     // ==========================================
-    // 5. OUTPUTS (Zwracanie danych po wdrożeniu)
+    // 5. CLOUDFRONT + WAF (Rate limiting przed API Gateway)
+    // ==========================================
+
+    // HTTP API nie obsługuje WAF bezpośrednio, dlatego ruch idzie przez CloudFront z podpiętym Web ACL
+    const distribution = new cloudfront.Distribution(this, "Qa3Distribution", {
+      comment: "QA3 API - CloudFront + WAF przed HTTP API",
+      webAclId: props.webAclArn,
+      domainNames: [API_DOMAIN],
+      certificate: props.certificate,
+      // Najtańsza klasa - lokalizacje tylko w Ameryce Północnej i Europie
+      priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
+      defaultBehavior: {
+        origin: new origins.HttpOrigin(
+          `${httpApi.apiId}.execute-api.${this.region}.${this.urlSuffix}`,
+        ),
+        // HTTPS_ONLY zamiast przekierowania - redirect zgubiłby body żądania POST
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+        // Odpowiedzi API nie są cache'owane
+        cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+        // Przekazujemy wszystkie nagłówki (w tym x-api-key i Origin dla CORS) poza Host, którego wymaga API Gateway
+        originRequestPolicy:
+          cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+      },
+    });
+
+    // ==========================================
+    // 6. OUTPUTS (Zwracanie danych po wdrożeniu)
     // ==========================================
 
     // Po wykonaniu 'cdk deploy' konsola wyświetli gotowy adres URL do wklejenia w Next.js
     new cdk.CfnOutput(this, "ApiEndpoint", {
-      value: `${httpApi.apiEndpoint}/api/v1/generate`,
-      description: "Adres URL Endpointu API do wywołania z frontendu (Next.js)",
+      value: `https://${API_DOMAIN}${GENERATE_PATH}`,
+      description:
+        "Adres URL Endpointu API (przez CloudFront + WAF) do wywołania z frontendu (Next.js)",
+    });
+
+    // W Cloudflare: CNAME api -> ta wartość, z wyłączonym proxy (DNS only)
+    new cdk.CfnOutput(this, "CloudFrontDomainName", {
+      value: distribution.distributionDomainName,
+      description: `Cel rekordu CNAME ${API_DOMAIN} w Cloudflare (DNS only)`,
     });
 
     // Wartość klucza: aws secretsmanager get-secret-value --secret-id <ARN> --query SecretString --output text
